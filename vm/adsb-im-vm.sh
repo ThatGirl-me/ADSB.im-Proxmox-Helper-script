@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # ADS-B.im Proxmox Helper Script
-# - Downloads the official VM package (.tar.xz), extracts QCOW2, and creates a VM
-# - Interactive storage picker (whiptail if available; text fallback)
+# - Downloads official ADS-B.im VM package (.tar.xz), extracts QCOW2, and creates a VM
+# - Correctly detects ACTIVE storages from `pvesm status` (column 3)
+# - Lets you pick storage (whiptail if present; text fallback)
+# - Ensures chosen storage allows `images` (adds it if missing)
+# - Optional self-heal: if ZERO active storages exist, creates a `local` dir storage at /var/lib/vz
 # - Defaults: SCSI + virtio-scsi-pci, virtio-net, boot from first disk
-# - Inspired by community helper scripts: https://community-scripts.github.io/ProxmoxVE/
+# - Tested on Proxmox VE 8.x
 
 set -euo pipefail
 
@@ -18,6 +21,7 @@ DEF_BUS="scsi"      # scsi|sata
 DEF_FW="1"          # 1=on, 0=off
 DEF_AUTOSTART="yes"
 DEF_IMAGE_GLOB="adsb-im*.qcow2"
+
 # Official release package (.tar.xz) containing the QCOW2
 DEF_URL="https://github.com/dirkhh/adsb-feeder-image/releases/download/v2.2.6/adsb-im-x86-64-vm-v2.2.6-proxmox.tar.xz"
 
@@ -25,6 +29,7 @@ DEF_URL="https://github.com/dirkhh/adsb-feeder-image/releases/download/v2.2.6/ad
 IMG="${IMG:-}"                 # path to local .qcow2 (if you already have it)
 IMG_URL="${IMG_URL:-$DEF_URL}" # URL to .tar.xz or .qcow2
 STORAGE="${STORAGE:-}"         # Proxmox storage ID
+STORAGE_PATH="${STORAGE_PATH:-}" # if creating a new dir storage, use this path
 VMID="${VMID:-}"               # explicit VMID
 VMNAME="${VMNAME:-$DEF_NAME}"
 CORES="${CORES:-$DEF_CORES}"
@@ -37,14 +42,16 @@ START_AFTER="${START_AFTER:-$DEF_AUTOSTART}"
 
 # ------------------------ Utils ------------------------
 fatal(){ echo -e "ERROR: $*" >&2; exit 1; }
-warn(){  echo -e "WARN : $*" >&2; }
-info(){  echo -e "INFO : $*"; }
+warn() { echo -e "WARN : $*" >&2; }
+info() { echo -e "INFO : $*"; }
 
 need_cmds(){ for c in "${REQUIRED_CMDS[@]}"; do command -v "$c" >/dev/null 2>&1 || fatal "Missing command: $c"; done; }
 is_pve8(){ pveversion | grep -Eq '^pve-manager/8\.'; }
 have_whiptail(){ command -v whiptail >/dev/null 2>&1; }
 
-active_storages(){ pvesm status | awk 'NR>1 && $2=="active"{print $1}'; }
+# pvesm status columns: 1=Name 2=Type 3=Status 4=Total 5=Used 6=Available 7=%
+active_storages(){ pvesm status | awk 'NR>1 && $3=="active"{print $1}'; }
+active_storage_count(){ pvesm status | awk 'NR>1 && $3=="active"{c++} END{print c+0}'; }
 
 storage_allows_images(){
   local id="$1"
@@ -63,8 +70,14 @@ list_image_storages(){
 
 enable_images_content(){
   local id="$1"
-  warn "Storage '$id' does not allow 'images'. Attempting to enable it…"
+  warn "Storage '$id' does not allow 'images'. Enabling it…"
   pvesm set "$id" --content images,rootdir,iso,backup,vztmpl,snippets || fatal "Failed to set content=images on $id"
+}
+
+create_dir_storage(){
+  local id="$1" path="$2"
+  mkdir -p "$path"
+  pvesm add dir "$id" --path "$path" --content images,iso,backup,vztmpl,rootdir,snippets
 }
 
 pick_storage_interactive(){
@@ -87,15 +100,38 @@ pick_storage_interactive(){
   else
     echo "Storages:"
     local i=1
-    for s in "${cands[@]}"; do echo "  [$i] $s"; i=$((i+1)); done
+    for s in "${cands[@]}"; do
+      local avail; avail=$(pvesm status | awk -v id="$s" '$1==id{print $6}')
+      printf "  [%d] %s (avail: %s)\n" "$i" "$s" "${avail:-?}"
+      i=$((i+1))
+    done
     read -rp "Enter number [1-${#cands[@]}]: " pick
     [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=${#cands[@]} )) || fatal "Invalid selection"
     STORAGE="${cands[$((pick-1))]}"
   fi
   info "Using storage: $STORAGE"
-
-  # Ensure chosen storage allows images
   storage_allows_images "$STORAGE" || enable_images_content "$STORAGE"
+}
+
+# If zero active storages exist, create a sane default
+ensure_storage_ready(){
+  if [[ "$(active_storage_count)" -eq 0 ]]; then
+    warn "No active storages detected; creating default dir storage 'local' at /var/lib/vz"
+    STORAGE="local"
+    create_dir_storage "local" "/var/lib/vz" || fatal "Failed to add dir storage 'local'"
+  else
+    # If user specified STORAGE, ensure it exists; otherwise, pick one interactively
+    if [[ -z "${STORAGE:-}" ]]; then
+      pick_storage_interactive
+    else
+      if ! active_storages | grep -Fxq "$STORAGE"; then
+        local path="${STORAGE_PATH:-/var/lib/vz/$STORAGE}"
+        warn "Storage '$STORAGE' not active; creating a dir storage at: $path"
+        create_dir_storage "$STORAGE" "$path" || fatal "Failed to add dir storage '$STORAGE'"
+      fi
+      storage_allows_images "$STORAGE" || enable_images_content "$STORAGE"
+    fi
+  fi
 }
 
 # Download (.tar.xz or .qcow2) into /tmp and return the file path
@@ -127,27 +163,27 @@ expand_to_qcow2(){
 }
 
 resize_qcow2(){ qemu-img resize -f qcow2 "$1" "$2"; }
-
 gen_mac(){ printf '02:%02x:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)); }
 
 # ------------------------ CLI ------------------------
 show_help(){
 cat <<EOF
 Usage: $(basename "$0") [options]
-  -S|--storage <id>   Proxmox storage ID (must be active)
-  -i <qcow2>          Local .qcow2 (skips download)
-  -u <url>            URL to .tar.xz or .qcow2 (default: $DEF_URL)
-  -v <vmid>           VMID (default: next free)
-  -n <name>           VM name (default: $VMNAME)
-  -c <cores>          vCPU cores (default: $CORES)
-  -m <MB>             Memory in MB (default: $MEM_MB)
-  -b <bridge>         Network bridge (default: $BRIDGE)
-  --sata              Use SATA (default: SCSI)
-  --no-firewall       Disable the Proxmox firewall flag on the VM
-  --no-start          Do not auto-start the VM after creation
-  -s <size>           Disk size, e.g. 16G (default: $DISK_SIZE)
-  -h|--help           Show help
-Environment variables also supported: IMG, IMG_URL, STORAGE, VMID, VMNAME, CORES, MEM_MB, SIZE, BRIDGE, BUS, FIREWALL, START_AFTER
+  -S|--storage <id>      Proxmox storage ID (must be active or will be created as dir storage)
+  --storage-path <path>  If creating a NEW dir storage with the name above, use this filesystem path
+  -i <qcow2>             Local .qcow2 (skips download)
+  -u <url>               URL to .tar.xz or .qcow2 (default: $DEF_URL)
+  -v <vmid>              VMID (default: next free)
+  -n <name>              VM name (default: $VMNAME)
+  -c <cores>             vCPU cores (default: $CORES)
+  -m <MB>                Memory in MB (default: $MEM_MB)
+  -b <bridge>            Network bridge (default: $BRIDGE)
+  --sata                 Use SATA (default: SCSI)
+  --no-firewall          Disable the Proxmox firewall flag on the VM
+  --no-start             Do not auto-start the VM after creation
+  -s <size>              Disk size, e.g. 16G (default: $DISK_SIZE)
+  -h|--help              Show help
+Environment variables also supported: IMG, IMG_URL, STORAGE, STORAGE_PATH, VMID, VMNAME, CORES, MEM_MB, SIZE, BRIDGE, BUS, FIREWALL, START_AFTER
 EOF
 }
 
@@ -155,6 +191,7 @@ ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -S|--storage) STORAGE="${2:-}"; shift 2;;
+    --storage-path) STORAGE_PATH="${2:-}"; shift 2;;
     -i) IMG="${2:-}"; shift 2;;
     -u) IMG_URL="${2:-}"; shift 2;;
     -v) VMID="${2:-}"; shift 2;;
@@ -177,7 +214,7 @@ set -- "${ARGS[@]}"
 need_cmds
 is_pve8 || warn "Script tested on Proxmox VE 8.x; continuing…"
 
-# ------------------------ Setup (Simple/Advanced) ------------------------
+# ------------------------ Mode (simple/advanced) ------------------------
 if have_whiptail; then
   sel=$(whiptail --title "ADS-B.im VM Installer" --radiolist "Choose mode" 12 60 2 \
     "simple"   "Use sensible defaults" ON \
@@ -212,17 +249,12 @@ if [[ "$sel" == "advanced" ]]; then
   fi
 fi
 
-# ------------------------ Storage ------------------------
-if [[ -z "$STORAGE" ]]; then
-  pick_storage_interactive
-else
-  active_storages | grep -Fxq "$STORAGE" || fatal "Storage '$STORAGE' is not active (see 'pvesm status')"
-  storage_allows_images "$STORAGE" || enable_images_content "$STORAGE"
-fi
+# ------------------------ Storage (robust) ------------------------
+ensure_storage_ready
+info "Using storage: $STORAGE"
 
 # ------------------------ Image Source ------------------------
 if [[ -z "${IMG:-}" ]]; then
-  # Download the default URL (tar.xz) and expand to qcow2
   PKG="$(dl_any "$IMG_URL" "/tmp/adsb-im.$RANDOM.pkg")"
   IMG="$(expand_to_qcow2 "$PKG")"
 fi
@@ -231,7 +263,7 @@ fi
 # Safe resize (no-op if already >= requested size)
 resize_qcow2 "$IMG" "$DISK_SIZE"
 
-# ------------------------ VM create ------------------------
+# ------------------------ VM Create ------------------------
 [[ -n "${VMID:-}" ]] || VMID="$(pvesh get /cluster/nextid)"
 MAC="$(gen_mac)"
 
@@ -252,7 +284,6 @@ else
   BOOTDEV="scsi0"
 fi
 
-# Create VM and import disk in one step
 qm create "$VMID" \
   -name "$VMNAME" \
   -ostype l26 \
