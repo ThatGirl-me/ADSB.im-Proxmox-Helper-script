@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# ADS-B.im Proxmox Helper Script
-# - Downloads official ADS-B.im VM package (.tar.xz), extracts QCOW2, and creates a VM
-# - Correctly detects ACTIVE storages from `pvesm status` (column 3)
-# - Lets you pick storage (whiptail if present; text fallback)
-# - Ensures chosen storage allows `images` (adds it if missing)
-# - Optional self-heal: if ZERO active storages exist, creates a `local` dir storage at /var/lib/vz
+# ADS-B.im Proxmox Helper Script (Whiptail GUI)
+# - Blue TUI menus via whiptail (community-helper style)
+# - Correct storage detection (pvesm status col 3 == active)
+# - Ensures chosen storage allows 'images' (type-aware)
+# - Downloads official .tar.xz, extracts QCOW2, imports in one step
 # - Defaults: SCSI + virtio-scsi-pci, virtio-net, boot from first disk
-# - Tested on Proxmox VE 8.x
+# - Proxmox VE 8.x compatible
 
 set -euo pipefail
 
@@ -20,17 +19,14 @@ DEF_BRIDGE="vmbr0"
 DEF_BUS="scsi"      # scsi|sata
 DEF_FW="1"          # 1=on, 0=off
 DEF_AUTOSTART="yes"
-DEF_IMAGE_GLOB="adsb-im*.qcow2"
-
-# Official release package (.tar.xz) containing the QCOW2
 DEF_URL="https://github.com/dirkhh/adsb-feeder-image/releases/download/v2.2.6/adsb-im-x86-64-vm-v2.2.6-proxmox.tar.xz"
 
-# Env/CLI overrides
-IMG="${IMG:-}"                 # path to local .qcow2 (if you already have it)
-IMG_URL="${IMG_URL:-$DEF_URL}" # URL to .tar.xz or .qcow2
-STORAGE="${STORAGE:-}"         # Proxmox storage ID
-STORAGE_PATH="${STORAGE_PATH:-}" # if creating a new dir storage, use this path
-VMID="${VMID:-}"               # explicit VMID
+# Env/CLI overrides (still supported for headless use)
+IMG="${IMG:-}"                   # path to local .qcow2 (optional)
+IMG_URL="${IMG_URL:-$DEF_URL}"   # URL to .tar.xz or .qcow2
+STORAGE="${STORAGE:-}"           # Proxmox storage ID
+STORAGE_PATH="${STORAGE_PATH:-}" # path for new dir storage if created
+VMID="${VMID:-}"                 # explicit VMID
 VMNAME="${VMNAME:-$DEF_NAME}"
 CORES="${CORES:-$DEF_CORES}"
 MEM_MB="${MEM_MB:-$DEF_MEM_MB}"
@@ -40,38 +36,62 @@ BUS="${BUS:-$DEF_BUS}"
 FIREWALL="${FIREWALL:-$DEF_FW}"
 START_AFTER="${START_AFTER:-$DEF_AUTOSTART}"
 
-# ------------------------ Utils ------------------------
-fatal(){ echo -e "ERROR: $*" >&2; exit 1; }
-warn() { echo -e "WARN : $*" >&2; }
-info() { echo -e "INFO : $*"; }
-
-need_cmds(){ for c in "${REQUIRED_CMDS[@]}"; do command -v "$c" >/dev/null 2>&1 || fatal "Missing command: $c"; done; }
-is_pve8(){ pveversion | grep -Eq '^pve-manager/8\.'; }
+# ------------------------ UI helpers ------------------------
 have_whiptail(){ command -v whiptail >/dev/null 2>&1; }
+ui_msg(){ whiptail --title "ADS-B.im installer" --msgbox "$1" "${2:-12}" "${3:-74}" 1>&2; }
+ui_yesno(){ whiptail --title "ADS-B.im installer" --yesno "$1" "${2:-12}" "${3:-74}" 1>&2; }
+ui_input(){ whiptail --title "ADS-B.im installer" --inputbox "$1" "${3:-10}" "${4:-70}" "$2" 3>&1 1>&2 2>&3; }
+ui_menu(){  whiptail --title "ADS-B.im installer" --menu "$1" "${2:-20}" "${3:-74}" "${4:-10}" "${@:5}" 3>&1 1>&2 2>&3; }
+ui_radio(){ whiptail --title "ADS-B.im installer" --radiolist "$1" "${2:-18}" "${3:-74}" "${4:-8}" "${@:5}" 3>&1 1>&2 2>&3; }
+ui_info(){ whiptail --title "ADS-B.im installer" --infobox "$1" "${2:-10}" "${3:-74}" 1>&2; }
+ui_error(){ whiptail --title "ADS-B.im installer" --msgbox "ERROR:\n\n$1" "${2:-12}" "${3:-74}" 1>&2; }
 
+fatal(){ ui_error "$1"; exit 1; }
+
+need_cmds(){
+  for c in "${REQUIRED_CMDS[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || fatal "Missing command: $c"
+  done
+}
+
+ensure_whiptail(){
+  if have_whiptail; then return 0; fi
+  echo "whiptail not found. Attempting to install..." >&2
+  if command -v apt >/dev/null 2>&1; then
+    apt update -y >/dev/null 2>&1 || true
+    apt install -y whiptail >/dev/null 2>&1 || true
+  fi
+  have_whiptail || { echo "Please install whiptail: apt install -y whiptail" >&2; exit 1; }
+}
+
+# ------------------------ Proxmox storage helpers ------------------------
 # pvesm status columns: 1=Name 2=Type 3=Status 4=Total 5=Used 6=Available 7=%
 active_storages(){ pvesm status | awk 'NR>1 && $3=="active"{print $1}'; }
 active_storage_count(){ pvesm status | awk 'NR>1 && $3=="active"{c++} END{print c+0}'; }
+storage_type(){ pvesm status | awk -v id="$1" 'NR>1 && $1==id{print $2; exit}'; }
+storage_available(){ pvesm status | awk -v id="$1" 'NR>1 && $1==id{print $6; exit}'; }
 
-storage_allows_images(){
-  local id="$1"
-  awk -v want="$id" '
-    /^[a-z]/ && /: / { split($0,a,":"); gsub(/^ +| +$/,"",a[2]); id=a[2] }
-    /^[[:space:]]*content/ && $0 ~ /images/ && id==want { print "yes" }
+# Returns 0 if storage has 'images' in its content set
+storage_allows_images() {
+  local want="$1"
+  awk -v want="$want" '
+    /^[a-z]/ && /: / { split($0,a,":"); id=a[2]; gsub(/^ +| +$/,"",id); cur=(id==want) }
+    cur && /^[[:space:]]*content[[:space:]]*:/ {
+      line=$0; gsub(/^.*content[[:space:]]*:[[:space:]]*/,"",line)
+      gsub(/[[:space:]]/,"",line)
+      if (line ~ /(^|,)images(,|$)/) { print "yes"; exit }
+    }
   ' /etc/pve/storage.cfg 2>/dev/null | grep -q yes
 }
 
-list_image_storages(){
-  while read -r s; do
-    [[ -n "$s" ]] || continue
-    storage_allows_images "$s" && echo "$s"
-  done < <(active_storages)
-}
-
-enable_images_content(){
-  local id="$1"
-  warn "Storage '$id' does not allow 'images'. Enabling it…"
-  pvesm set "$id" --content images,rootdir,iso,backup,vztmpl,snippets || fatal "Failed to set content=images on $id"
+ensure_images_content(){
+  local id="$1" type; type="$(storage_type "$id")"
+  storage_allows_images "$id" && return 0
+  case "$type" in
+    dir)      pvesm set "$id" --content images,iso,backup,vztmpl,rootdir,snippets ;;
+    zfspool|lvmthin|lvm) pvesm set "$id" --content images,rootdir ;;
+    *)        pvesm set "$id" --content images,rootdir ;;
+  esac
 }
 
 create_dir_storage(){
@@ -80,98 +100,51 @@ create_dir_storage(){
   pvesm add dir "$id" --path "$path" --content images,iso,backup,vztmpl,rootdir,snippets
 }
 
-pick_storage_interactive(){
-  mapfile -t cands < <(list_image_storages)
-  if [[ ${#cands[@]} -eq 0 ]]; then
-    warn "No storages marked with 'images'. Falling back to ALL active storages."
-    mapfile -t cands < <(active_storages)
-    [[ ${#cands[@]} -gt 0 ]] || fatal "No active storages found (see 'pvesm status')."
-  fi
-
-  if have_whiptail; then
-    local items=() i=1 choice
-    for s in "${cands[@]}"; do
-      local avail; avail=$(pvesm status | awk -v id="$s" '$1==id{print $6}')
-      items+=("$i" "$s (avail: ${avail:-?})")
-      i=$((i+1))
-    done
-    choice=$(whiptail --title "Select Storage" --menu "Choose Proxmox storage for the VM disk" 20 70 10 "${items[@]}" 3>&1 1>&2 2>&3) || exit 1
-    STORAGE="${cands[$((choice-1))]}"
-  else
-    echo "Storages:"
-    local i=1
-    for s in "${cands[@]}"; do
-      local avail; avail=$(pvesm status | awk -v id="$s" '$1==id{print $6}')
-      printf "  [%d] %s (avail: %s)\n" "$i" "$s" "${avail:-?}"
-      i=$((i+1))
-    done
-    read -rp "Enter number [1-${#cands[@]}]: " pick
-    [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=${#cands[@]} )) || fatal "Invalid selection"
-    STORAGE="${cands[$((pick-1))]}"
-  fi
-  info "Using storage: $STORAGE"
-  storage_allows_images "$STORAGE" || enable_images_content "$STORAGE"
-}
-
-# If zero active storages exist, create a sane default
-ensure_storage_ready(){
-  if [[ "$(active_storage_count)" -eq 0 ]]; then
-    warn "No active storages detected; creating default dir storage 'local' at /var/lib/vz"
-    STORAGE="local"
-    create_dir_storage "local" "/var/lib/vz" || fatal "Failed to add dir storage 'local'"
-  else
-    # If user specified STORAGE, ensure it exists; otherwise, pick one interactively
-    if [[ -z "${STORAGE:-}" ]]; then
-      pick_storage_interactive
-    else
-      if ! active_storages | grep -Fxq "$STORAGE"; then
-        local path="${STORAGE_PATH:-/var/lib/vz/$STORAGE}"
-        warn "Storage '$STORAGE' not active; creating a dir storage at: $path"
-        create_dir_storage "$STORAGE" "$path" || fatal "Failed to add dir storage '$STORAGE'"
-      fi
-      storage_allows_images "$STORAGE" || enable_images_content "$STORAGE"
-    fi
-  fi
-}
-
-# Download (.tar.xz or .qcow2) into /tmp and return the file path
+# ------------------------ Download / extract helpers ------------------------
+# Download returns ONLY the file path (with sensible extension)
 dl_any(){
-  local url="$1"
-  local out="${2:-/tmp/adsb-im-download.$RANDOM}"
-  info "Downloading: $url"
-  wget -q -O "$out" "$url" || fatal "Download failed: $url"
+  local url="$1" base="/tmp/adsb-im.$RANDOM" out
+  case "$url" in
+    *.qcow2) out="${base}.qcow2" ;;
+    *.tar.xz|*.txz) out="${base}.tar.xz" ;;
+    *) out="${base}.pkg" ;;
+  esac
+  ui_info "Downloading image...\n\n$url"; sleep 1
+  if ! wget -q -O "$out" "$url"; then
+    fatal "Download failed:\n$url"
+  fi
   echo "$out"
 }
 
-# If .tar.xz: extract and return first .qcow2 path; if .qcow2: return it as is
+# Try tar first; if not, treat as qcow2 (validated with qemu-img)
 expand_to_qcow2(){
   local in="$1"
-  if [[ "$in" =~ \.qcow2$ ]]; then
-    echo "$in"; return 0
-  fi
-  if [[ "$in" =~ \.tar\.xz$ ]] || [[ "$in" =~ \.txz$ ]]; then
+  if tar -tJf "$in" >/dev/null 2>&1; then
     local tmpd; tmpd="$(mktemp -d)"
-    info "Extracting $(basename "$in") to $tmpd"
-    tar -xJf "$in" -C "$tmpd" || fatal "Failed to extract archive"
-    local qcow
-    qcow="$(find "$tmpd" -maxdepth 2 -type f -name '*.qcow2' | head -n1)"
-    [[ -n "$qcow" ]] || fatal "No .qcow2 found inside archive"
+    ui_info "Extracting image archive...\n\n$(basename "$in")\n\nto: $tmpd"; sleep 1
+    if ! tar -xJf "$in" -C "$tmpd"; then
+      fatal "Failed to extract archive:\n$in"
+    fi
+    local qcow; qcow="$(find "$tmpd" -maxdepth 4 -type f -name '*.qcow2' | head -n1)"
+    [ -n "$qcow" ] || fatal "No .qcow2 found inside archive."
     echo "$qcow"
-    return 0
+  elif qemu-img info "$in" >/dev/null 2>&1; then
+    echo "$in"
+  else
+    fatal "Unsupported image format:\n$in\n\nExpect a .tar.xz with qcow2 inside, or a qcow2 file."
   fi
-  fatal "Unsupported image format: $in (expected .qcow2 or .tar.xz)"
 }
 
 resize_qcow2(){ qemu-img resize -f qcow2 "$1" "$2"; }
 gen_mac(){ printf '02:%02x:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)); }
 
-# ------------------------ CLI ------------------------
+# ------------------------ CLI (still supported) ------------------------
 show_help(){
-cat <<EOF
+cat <<HLP
 Usage: $(basename "$0") [options]
-  -S|--storage <id>      Proxmox storage ID (must be active or will be created as dir storage)
-  --storage-path <path>  If creating a NEW dir storage with the name above, use this filesystem path
-  -i <qcow2>             Local .qcow2 (skips download)
+  -S|--storage <id>      Proxmox storage ID (must be active; if missing, will create dir storage)
+  --storage-path <path>  Filesystem path if creating a NEW dir storage named above
+  -i <qcow2>             Local .qcow2 (skip download)
   -u <url>               URL to .tar.xz or .qcow2 (default: $DEF_URL)
   -v <vmid>              VMID (default: next free)
   -n <name>              VM name (default: $VMNAME)
@@ -179,16 +152,15 @@ Usage: $(basename "$0") [options]
   -m <MB>                Memory in MB (default: $MEM_MB)
   -b <bridge>            Network bridge (default: $BRIDGE)
   --sata                 Use SATA (default: SCSI)
-  --no-firewall          Disable the Proxmox firewall flag on the VM
-  --no-start             Do not auto-start the VM after creation
+  --no-firewall          Disable Proxmox firewall flag on the VM
+  --no-start             Do not auto-start the VM
   -s <size>              Disk size, e.g. 16G (default: $DISK_SIZE)
   -h|--help              Show help
-Environment variables also supported: IMG, IMG_URL, STORAGE, STORAGE_PATH, VMID, VMNAME, CORES, MEM_MB, SIZE, BRIDGE, BUS, FIREWALL, START_AFTER
-EOF
+HLP
 }
 
 ARGS=()
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
   case "$1" in
     -S|--storage) STORAGE="${2:-}"; shift 2;;
     --storage-path) STORAGE_PATH="${2:-}"; shift 2;;
@@ -210,94 +182,114 @@ done
 set -- "${ARGS[@]}"
 
 # ------------------------ Preflight ------------------------
-[[ $EUID -eq 0 ]] || fatal "Run as root"
+[ "$EUID" -eq 0 ] || { echo "Run as root"; exit 1; }
+ensure_whiptail
 need_cmds
-is_pve8 || warn "Script tested on Proxmox VE 8.x; continuing…"
 
-# ------------------------ Mode (simple/advanced) ------------------------
-if have_whiptail; then
-  sel=$(whiptail --title "ADS-B.im VM Installer" --radiolist "Choose mode" 12 60 2 \
-    "simple"   "Use sensible defaults" ON \
-    "advanced" "Customize all settings" OFF 3>&1 1>&2 2>&3) || exit 1
+# ------------------------ Mode ------------------------
+MODE=$(ui_radio "Choose mode" 12 70 2 \
+  "simple"   "Use sensible defaults" ON \
+  "advanced" "Customize all settings" OFF) || exit 1
+
+# ------------------------ Storage (GUI) ------------------------
+if [ "$(active_storage_count)" -eq 0 ]; then
+  ui_msg "No active storages detected.\n\nI'll create a default directory storage 'local' at /var/lib/vz."
+  STORAGE="local"
+  create_dir_storage "local" "/var/lib/vz" || fatal "Failed to add dir storage 'local'."
 else
-  read -rp "Mode: [S]imple/[A]dvanced? " sel
-  [[ "${sel,,}" =~ ^a ]] && sel="advanced" || sel="simple"
-fi
-
-if [[ "$sel" == "advanced" ]]; then
-  if have_whiptail; then
-    VMNAME=$(whiptail --inputbox "VM name:" 10 60 "$VMNAME" 3>&1 1>&2 2>&3) || exit 1
-    CORES=$(whiptail --inputbox "vCPU cores:" 10 60 "$CORES" 3>&1 1>&2 2>&3) || exit 1
-    MEM_MB=$(whiptail --inputbox "Memory (MB):" 10 60 "$MEM_MB" 3>&1 1>&2 2>&3) || exit 1
-    DISK_SIZE=$(whiptail --inputbox "Disk size (e.g. 16G):" 10 60 "$DISK_SIZE" 3>&1 1>&2 2>&3) || exit 1
-    BRIDGE=$(whiptail --inputbox "Bridge:" 10 60 "$BRIDGE" 3>&1 1>&2 2>&3) || exit 1
-    BUS=$(whiptail --radiolist "Disk bus:" 12 60 2 \
-      "scsi" "virtio-scsi (recommended)" ON \
-      "sata" "SATA" OFF 3>&1 1>&2 2>&3) || exit 1
-    START_AFTER=$(whiptail --radiolist "Start VM after creation?" 12 60 2 "yes" "" ON "no" "" OFF 3>&1 1>&2 2>&3) || exit 1
-    fw=$(whiptail --radiolist "Enable Proxmox firewall flag?" 12 60 2 "1" "On" ON "0" "Off" OFF 3>&1 1>&2 2>&3) || exit 1
-    FIREWALL="$fw"
-  else
-    read -rp "VM name [$VMNAME]: " t; VMNAME="${t:-$VMNAME}"
-    read -rp "vCPU cores [$CORES]: " t; CORES="${t:-$CORES}"
-    read -rp "Memory MB [$MEM_MB]: " t; MEM_MB="${t:-$MEM_MB}"
-    read -rp "Disk size [$DISK_SIZE]: " t; DISK_SIZE="${t:-$DISK_SIZE}"
-    read -rp "Bridge [$BRIDGE]: " t; BRIDGE="${t:-$BRIDGE}"
-    read -rp "Disk bus [scsi|sata] [$BUS]: " t; BUS="${t:-$BUS}"
-    read -rp "Start after create? [yes/no] [$START_AFTER]: " t; START_AFTER="${t:-$START_AFTER}"
-    read -rp "Firewall flag [1/0] [$FIREWALL]: " t; FIREWALL="${t:-$FIREWALL}"
+  if [ -z "${STORAGE:-}" ]; then
+    # Build menu items: <key> <label>
+    MENU_ITEMS=()
+    while read -r name; do
+      avail="$(storage_available "$name")"; typ="$(storage_type "$name")"
+      MENU_ITEMS+=("$name" "type: $typ   avail: $avail")
+    done < <(active_storages)
+    STORAGE=$(ui_menu "Select Proxmox storage for the VM disk" 20 74 10 "${MENU_ITEMS[@]}") || exit 1
+  fi
+  # If named storage not active, create dir storage path
+  if ! active_storages | grep -Fxq "$STORAGE"; then
+    local_path="${STORAGE_PATH:-/var/lib/vz/$STORAGE}"
+    ui_msg "Storage '$STORAGE' is not active.\n\nI will create a directory storage at:\n$local_path"
+    create_dir_storage "$STORAGE" "$local_path" || fatal "Failed to add dir storage '$STORAGE'."
   fi
 fi
 
-# ------------------------ Storage (robust) ------------------------
-ensure_storage_ready
-info "Using storage: $STORAGE"
+ensure_images_content "$STORAGE"
 
-# ------------------------ Image Source ------------------------
-if [[ -z "${IMG:-}" ]]; then
-  PKG="$(dl_any "$IMG_URL" "/tmp/adsb-im.$RANDOM.pkg")"
-  IMG="$(expand_to_qcow2 "$PKG")"
+# ------------------------ Advanced settings (GUI) ------------------------
+if [ "$MODE" = "advanced" ]; then
+  VMNAME=$(ui_input "VM name:" "$VMNAME") || exit 1
+  CORES=$(ui_input "vCPU cores:" "$CORES") || exit 1
+  MEM_MB=$(ui_input "Memory (MB):" "$MEM_MB") || exit 1
+  DISK_SIZE=$(ui_input "Disk size (e.g., 16G):" "$DISK_SIZE") || exit 1
+  BRIDGE=$(ui_input "Network bridge:" "$BRIDGE") || exit 1
+  BUS=$(ui_radio "Disk bus" 14 70 2 \
+        "scsi" "virtio-scsi (recommended)" ON \
+        "sata" "SATA" OFF) || exit 1
+  fwsel=$(ui_radio "Enable Proxmox firewall flag on the VM?" 14 70 2 \
+        "1" "On" ON \
+        "0" "Off" OFF) || exit 1
+  FIREWALL="$fwsel"
+  startsel=$(ui_radio "Start VM after creation?" 14 70 2 \
+        "yes" "" ON \
+        "no"  "" OFF) || exit 1
+  START_AFTER="$startsel"
 fi
-[[ -f "$IMG" ]] || fatal "Image not found: $IMG"
 
-# Safe resize (no-op if already >= requested size)
+# ------------------------ Download / Image prepare (GUI) ------------------------
+if [ -z "${IMG:-}" ]; then
+  PKG="$(dl_any "$IMG_URL")"          # prints path only
+  IMG="$(expand_to_qcow2 "$PKG")"     # prints path only
+fi
+[ -f "$IMG" ] || fatal "Image not found:\n$IMG"
+
+ui_info "Resizing image to $DISK_SIZE ..."; sleep 1
 resize_qcow2 "$IMG" "$DISK_SIZE"
 
 # ------------------------ VM Create ------------------------
-[[ -n "${VMID:-}" ]] || VMID="$(pvesh get /cluster/nextid)"
+[ -n "${VMID:-}" ] || VMID="$(pvesh get /cluster/nextid)"
 MAC="$(gen_mac)"
 
-echo "==> Creating VM $VMID ($VMNAME)"
-echo "    Storage  : $STORAGE"
-echo "    Disk     : $IMG  -> $DISK_SIZE  ($BUS)"
-echo "    CPU/Mem  : $CORES cores / $MEM_MB MB"
-echo "    Bridge   : $BRIDGE"
-echo "    Firewall : $FIREWALL"
+SUMMARY="Create VM with these settings?
 
-BUS_OPTS=(); BOOTDEV=""; DISK_ARG=""
-if [[ "$BUS" == "sata" ]]; then
-  DISK_ARG="-sata0 ${STORAGE}:0,import-from=${PWD}/${IMG}"
+VMID      : $VMID
+Name      : $VMNAME
+Storage   : $STORAGE
+Disk      : $(basename "$IMG") -> $DISK_SIZE ($BUS)
+CPU/Mem   : $CORES cores / $MEM_MB MB
+Bridge    : $BRIDGE
+Firewall  : $FIREWALL
+Autostart : $START_AFTER"
+
+ui_yesno "$SUMMARY" 18 70 || exit 0
+
+BOOTDEV=""; DISK_ARG=""; SCSI_OPT=""
+if [ "$BUS" = "sata" ]; then
+  DISK_ARG="-sata0 ${STORAGE}:0,import-from=${IMG}"
   BOOTDEV="sata0"
 else
-  BUS_OPTS+=(--scsihw virtio-scsi-pci)
-  DISK_ARG="-scsi0 ${STORAGE}:0,import-from=${PWD}/${IMG}"
+  SCSI_OPT="--scsihw virtio-scsi-pci"
+  DISK_ARG="-scsi0 ${STORAGE}:0,import-from=${IMG}"
   BOOTDEV="scsi0"
 fi
 
+ui_info "Creating VM $VMID ($VMNAME)..."; sleep 1
 qm create "$VMID" \
-  -name "$VMNAME" \
-  -ostype l26 \
+  -name "$VMNAME" -ostype l26 \
   -cpu host -balloon 0 \
   -cores "$CORES" -memory "$MEM_MB" \
   -net0 "virtio=${MAC},bridge=${BRIDGE},firewall=${FIREWALL}" \
-  ${BUS_OPTS[@]+"${BUS_OPTS[@]}"} \
-  ${DISK_ARG} \
+  $SCSI_OPT \
+  $DISK_ARG \
   -boot "order=${BOOTDEV}"
 
-echo "==> VM $VMID has been created."
+# ------------------------ Start or not ------------------------
 if [[ "${START_AFTER,,}" == "yes" ]]; then
-  qm start "$VMID" || warn "Failed to start VM $VMID"
-  echo "Console: qm console $VMID   (CTRL+] to exit)"
+  if qm start "$VMID"; then
+    ui_msg "VM $VMID created and started.\n\nOpen console:\nqm console $VMID"
+  else
+    ui_msg "VM $VMID created, but failed to start.\n\nStart manually:\nqm start $VMID"
+  fi
 else
-  echo "You can start it later with: qm start $VMID"
+  ui_msg "VM $VMID created.\n\nStart later with:\nqm start $VMID"
 fi
