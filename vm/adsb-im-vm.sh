@@ -107,7 +107,7 @@ dl_any(){
   case "$url" in
     *.qcow2) out="${base}.qcow2" ;;
     *.tar.xz|*.txz) out="${base}.tar.xz" ;;
-    *) out="${base}.pkg" ;;
+*.tar.xz) out="${base}.tar.xz" ;;
   esac
   ui_info "Downloading image...\n\n$url"; sleep 1
   if ! wget -q -O "$out" "$url"; then
