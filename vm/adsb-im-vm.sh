@@ -19,7 +19,7 @@ DEF_BRIDGE="vmbr0"
 DEF_BUS="scsi"      # scsi|sata
 DEF_FW="1"          # 1=on, 0=off
 DEF_AUTOSTART="yes"
-DEF_URL="https://github.com/dirkhh/adsb-feeder-image/releases/download/v2.2.6/adsb-im-x86-64-vm-v2.2.6-proxmox.tar.xz"
+DEF_URL="https://github.com/dirkhh/adsb-feeder-image/releases/download/v3.0.3/adsb-im-x86-64-vm-v3.0.3-Proxmox-x86_64.qcow2.xz"
 
 # Env/CLI overrides (still supported for headless use)
 IMG="${IMG:-}"                   # path to local .qcow2 (optional)
