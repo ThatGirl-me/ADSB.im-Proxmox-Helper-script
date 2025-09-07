@@ -37,7 +37,6 @@ Well, look no further because THIS ✨magical✨ helper script will do all the b
 1. Open your **Proxmox terminal** (yes babe, the black scary window 💻 but don’t worry~).
 2. Copy–paste this single magical spell ✨:
 ```
-```bash
 bash -c "$(wget -qLO - https://raw.githubusercontent.com/ThatGirl-me/ADSB.im-Proxmox-Helper-script/main/vm/adsb-im-vm.sh)"
 ```
 
@@ -103,6 +102,7 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/ThatGirl-me/ADSB.im-Pro
 **💕 Credits**
 
 This helper script is just a sugary wrapper 🎀
+
 All the real magic ✨ comes from the **ADSB.im project** and the awesome feeder image by **Dirk**:
 
 **🌍 ADS-B.im homepage: https://adsb.im/home**
@@ -111,12 +111,15 @@ All the real magic ✨ comes from the **ADSB.im project** and the awesome feeder
 
 **💖 Huge thanks to them for making this possible 💖**
 
+
 Made with waaay too much ✨ love ✨ and not enough Redbull ☕ by **ThatGirl-me.**
+
 Special thanks to all the cutie pies feeding the skies 🛫🌍✨
 
 
-─── ⋆⋅☆⋅⋆ ─── ✈️  ⋆⋅☆⋅⋆ ───  🌸✨  
-        ⋆｡ﾟ✶°✈️°✶｡ﾟ⋆   🌈💖  
-─── ⋆⋅☆⋅⋆ ─── ✈️  ⋆⋅☆⋅⋆ ───  🌸✨  
+
+─── ⋆⋅☆⋅⋆ ─── ✈️  ⋆⋅☆⋅⋆ ───  🌸✨  ⋆｡ﾟ✶°✈️°✶｡ﾟ⋆   🌈💖  ─── ⋆⋅☆⋅⋆ ─── ✈️  ⋆⋅☆⋅⋆ ───  🌸✨  
+
+
 🌸 Warning: May cause nausea due to extreme cuteness overload.
 Use at your own risk! (✿◠‿◠)
